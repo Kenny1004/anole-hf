@@ -1,3 +1,5 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES']='6'
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import ChameleonForCausalLM, Trainer, TrainingArguments
@@ -49,9 +51,14 @@ def zero_out_gradient(grad):
     return grad
 
 # Freeze all layers except the output layer
+
+
 for param in model.parameters():
     param.requires_grad = False
+    
+
 for param in model.lm_head.parameters():
+    
     # Compute the standard deviation for He initialization
     std_dev = (2.0 / 4096) ** 0.5
     # Initialize the specific rows with He initialization

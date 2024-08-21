@@ -17,7 +17,7 @@ DATASET_IMAGE_PATH = Path("./images/")
 ANOLE_PATH_TORCH = Path("./model/anole/")
 
 # Anole HF path (specify the path that you want to store your Anole hugging face checkpoint)
-ANOLE_PATH_HF = Path("./model/anole-hf/")
+ANOLE_PATH_HF = Path("/home/zlhu/data2/zlhu/facebook/chameleon-30b")
 
 # Anole HF path (specify the path that you want to store your fine-tuned Anole hugging face checkpoint)
-ANOLE_PATH_HF_TRAINED = Path("./model/anole-hf_trained/")
+ANOLE_PATH_HF_TRAINED = Path("/home/zlhu/data2/zlhu/chameleon-7b")

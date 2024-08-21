@@ -15,23 +15,33 @@
 """PyTorch Chameleon model."""
 
 import math
+import warnings
 from functools import cached_property
-from typing import List, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache, StaticCache
+from ...cache_utils import Cache, StaticCache
+from ...generation.configuration_utils import GenerationConfig
+from ...generation.logits_process import (
+    AllowOnlyTokensAtRelativeOffsetLogitsProcessor,
+    AllowOnlyTokensInRelativeWindowLogitsProcessor,
+    LogitsProcessorList,
+    SuppressTokensAtBeginLogitsProcessor,
+    SuppressTokensInIndexRangeLogitsProcessor,
+    SuppressTokensLogitsProcessor,
+)
+from ...generation.utils import GenerateOutput
 from ...modeling_attn_mask_utils import AttentionMaskConverter
+from ...modeling_flash_attention_utils import _flash_attention_forward
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
 )
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -44,12 +54,65 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_chameleon import ChameleonConfig
+from .configuration_chameleon import ChameleonConfig, ChameleonVQVAEConfig
 
 
 if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
+
+# Copied from transformers.models.llama.modeling_llama._prepare_4d_causal_attention_mask_with_cache_position
+def _prepare_4d_causal_attention_mask_with_cache_position(
+    attention_mask: torch.Tensor,
+    sequence_length: int,
+    target_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    min_dtype: float,
+    cache_position: torch.Tensor,
+    batch_size: int,
+):
+    """
+    Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
+    `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+
+    Args:
+        attention_mask (`torch.Tensor`):
+            A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
+        sequence_length (`int`):
+            The sequence length being processed.
+        target_length (`int`):
+            The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
+        dtype (`torch.dtype`):
+            The dtype to use for the 4D attention mask.
+        device (`torch.device`):
+            The device to plcae the 4D attention mask on.
+        min_dtype (`float`):
+            The minimum value representable with the dtype `dtype`.
+        cache_position (`torch.Tensor`):
+            Indices depicting the position of the input sequence tokens in the sequence.
+        batch_size (`torch.Tensor`):
+            Batch size.
+    """
+    if attention_mask is not None and attention_mask.dim() == 4:
+        # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+        causal_mask = attention_mask
+    else:
+        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
+        if sequence_length != 1:
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+        if attention_mask is not None:
+            causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+            mask_length = attention_mask.shape[-1]
+            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+            padding_mask = padding_mask == 0
+            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                padding_mask, min_dtype
+            )
+
+    return causal_mask
 
 
 logger = logging.get_logger(__name__)
@@ -59,19 +122,6 @@ _CHECKPOINT_FOR_DOC = "meta/chameleon-7b"
 _EXPECTED_OUTPUT_SHAPE = [1, 7, 4096]
 _SEQ_CLASS_EXPECTED_LOSS = 1.03
 _SEQ_CLASS_EXPECTED_OUTPUT = "'LABEL_0'"
-
-
-# Copied from transformers.models.llama.modeling_llama._get_unpad_data
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Chameleon
@@ -91,11 +141,15 @@ class ChameleonRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
 
 ALL_LAYERNORM_LAYERS.append(ChameleonRMSNorm)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Chameleon
+# copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Chameleon
+# TODO(joao): add me back asap :)
 class ChameleonRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
         super().__init__()
@@ -125,7 +179,8 @@ class ChameleonRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->Chameleon
+# copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->Chameleon
+# TODO(joao): add me back asap :)
 class ChameleonLinearScalingRotaryEmbedding(ChameleonRotaryEmbedding):
     """ChameleonRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
@@ -136,7 +191,8 @@ class ChameleonLinearScalingRotaryEmbedding(ChameleonRotaryEmbedding):
         return cos, sin
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->Chameleon
+# copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->Chameleon
+# TODO(joao): add me back asap :)
 class ChameleonDynamicNTKScalingRotaryEmbedding(ChameleonRotaryEmbedding):
     """ChameleonRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
@@ -210,6 +266,24 @@ class ChameleonMLP(nn.Module):
         return down_proj
 
 
+class ChameleonLayerNorm(nn.LayerNorm):
+    """
+    LayerNorm but computes stats only over the last dim because Chameleon applies gamma and beta
+    from each shard separately to each head, instead of reducing. We can apply each head's own
+    gamma/beta by repeat-interleaving weights from each shard, but the stats have to be computed
+    in the last dimension. This module applies gamma/beta manually to fulfill this requirement.
+    """
+
+    def __init__(self, hidden_size, *args, **kwargs):
+        super().__init__(hidden_size, *args, **kwargs)
+        self.normalized_shape = (hidden_size[-1],)
+
+    def forward(self, hidden_states):
+        hidden_states = F.layer_norm(hidden_states, self.normalized_shape, None, None, eps=1e-5)
+        hidden_states = hidden_states * self.weight + self.bias
+        return hidden_states
+
+
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -246,7 +320,7 @@ class ChameleonAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
-        self.qk_layernorm = config.qk_layernorm
+        self.model_parallel_size = config.model_parallel_size
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -258,12 +332,12 @@ class ChameleonAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
-        if self.qk_layernorm:
-            self.q_norm = nn.LayerNorm(self.head_dim)
-            self.k_norm = nn.LayerNorm(self.head_dim)
+        self.q_norm = ChameleonLayerNorm((self.num_heads, self.head_dim))
+        self.k_norm = ChameleonLayerNorm((self.num_key_value_heads, self.head_dim))
         self._init_rope()
 
-    # Copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->Chameleon
+    # copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->Chameleon
+    # TODO(joao): add me back asap :)
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = ChameleonRotaryEmbedding(
@@ -308,18 +382,11 @@ class ChameleonAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        if self.qk_layernorm:
-            # reshape for layernorm
-            query_states = query_states.view(-1, self.num_heads, self.head_dim)
-            key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        query_states = query_states.reshape(-1, self.num_heads, self.head_dim)
+        query_states = self.q_norm(query_states)
 
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        # permute key/value to use transformers RoPE implementation (see for more: https://github.com/huggingface/transformers/issues/25199)
-        # NOTE: permutation is done same way as in llama conversion script
-        key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim // 2, 2).transpose(3, 2)
-        query_states = query_states.view(-1, self.num_heads, self.head_dim // 2, 2).transpose(3, 2)
+        key_states = key_states.reshape(-1, self.num_key_value_heads, self.head_dim)
+        key_states = self.k_norm(key_states)
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -363,7 +430,8 @@ class ChameleonAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->Chameleon
+# copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->Chameleon
+# TODO(joao): add me back asap :)
 class ChameleonFlashAttention2(ChameleonAttention):
     """
     Chameleon flash attention module. This module inherits from `ChameleonAttention` as the weights of the module stays
@@ -391,6 +459,12 @@ class ChameleonFlashAttention2(ChameleonAttention):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError(
+                "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+                "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
+            )
+
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
@@ -399,24 +473,17 @@ class ChameleonFlashAttention2(ChameleonAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        if self.qk_layernorm:
-            # reshape for layernorm
-            query_states = query_states.view(-1, self.num_heads, self.head_dim)
-            key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        query_states = query_states.reshape(-1, self.num_heads, self.head_dim)
+        query_states = self.q_norm(query_states)
 
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        # permute key/value to use transformers RoPE implementation (see for more: https://github.com/huggingface/transformers/issues/25199)
-        # NOTE: permutation is done same way as in llama conversion script
-        key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim // 2, 2).transpose(3, 2)
-        query_states = query_states.view(-1, self.num_heads, self.head_dim // 2, 2).transpose(3, 2)
+        key_states = key_states.reshape(-1, self.num_key_value_heads, self.head_dim)
+        key_states = self.k_norm(key_states)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
-        query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids)
@@ -461,114 +528,25 @@ class ChameleonFlashAttention2(ChameleonAttention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            sliding_window=getattr(self, "sliding_window", None),
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
+            is_causal=self.is_causal,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
-    def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
-    ):
-        """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
-
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`float`):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-        """
-        if not self._flash_attn_uses_top_left_mask:
-            causal = self.is_causal
-        else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in ChameleonFlashAttention2 __init__.
-            causal = self.is_causal and query_length != 1
-
-        # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
-
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-            )
-
-        return attn_output
-
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
-
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
 
 
 class ChameleonSdpaAttention(ChameleonAttention):
@@ -611,18 +589,11 @@ class ChameleonSdpaAttention(ChameleonAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        if self.qk_layernorm:
-            # reshape for layernorm
-            query_states = query_states.view(-1, self.num_heads, self.head_dim)
-            key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        query_states = query_states.reshape(-1, self.num_heads, self.head_dim)
+        query_states = self.q_norm(query_states)
 
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        # permute key/value to use transformers RoPE implementation (see for more: https://github.com/huggingface/transformers/issues/25199)
-        # NOTE: permutation is done same way as in llama conversion script
-        key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim // 2, 2).transpose(3, 2)
-        query_states = query_states.view(-1, self.num_heads, self.head_dim // 2, 2).transpose(3, 2)
+        key_states = key_states.reshape(-1, self.num_key_value_heads, self.head_dim)
+        key_states = self.k_norm(key_states)
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -678,7 +649,8 @@ CHAMELEON_ATTENTION_CLASSES = {
 }
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaDecoderLayer with Llama->Chameleon, LLAMA->CHAMELEON
+# copied from transformers.models.llama.modeling_llama.LlamaDecoderLayer with Llama->Chameleon, LLAMA->CHAMELEON
+# TODO(joao): add me back asap :)
 class ChameleonDecoderLayer(nn.Module):
     def __init__(self, config: ChameleonConfig, layer_idx: int):
         super().__init__()
@@ -699,6 +671,7 @@ class ChameleonDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -713,6 +686,11 @@ class ChameleonDecoderLayer(nn.Module):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence
+            kwargs (`dict`, *optional*):
+                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
+                into the model
         """
         residual = hidden_states
 
@@ -727,6 +705,7 @@ class ChameleonDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -809,7 +788,6 @@ class ChameleonSwinDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -821,7 +799,7 @@ class ChameleonSwinDecoderLayer(nn.Module):
         return outputs
 
 
-class ChameleonVQModelVectorQuantizer(nn.Module):
+class ChameleonVQVAEVectorQuantizer(nn.Module):
     """
     A module for vector quantization using learned embedding vectors.
 
@@ -836,12 +814,14 @@ class ChameleonVQModelVectorQuantizer(nn.Module):
         super().__init__()
         self.num_embeddings = config.num_embeddings
         self.embedding_dim = config.embed_dim
+        self.quant_state_dims = [config.resolution // 2 ** (len(config.channel_multiplier) - 1)] * 2
         self.beta = getattr(config, "beta", 0.25)
 
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.re_embed = self.num_embeddings
 
-    def forward(self, hidden_state: torch.Tensor):
+    def forward(self, hidden_state: torch.FloatTensor):
+        batch_size = hidden_state.shape[0]
         hidden_state = hidden_state.permute(0, 2, 3, 1).contiguous()
         hidden_state_flattened = hidden_state.view(-1, self.embedding_dim)
 
@@ -866,10 +846,33 @@ class ChameleonVQModelVectorQuantizer(nn.Module):
         # reshape back to match original input shape
         hidden_state_quant = hidden_state_quant.permute(0, 3, 1, 2).contiguous()
 
-        return hidden_state_quant, loss, min_encoding_indices
+        return hidden_state_quant, loss, min_encoding_indices.view(batch_size, -1)
+
+    def get_codebook_entry(self, image_tokens: torch.LongTensor) -> torch.FloatTensor:
+        batch_size = image_tokens.shape[0]
+        emb_dim: int = self.embedding.weight.shape[-1]
+        # get quantized latent vectors
+        hidden_state_quant = self.embedding(image_tokens)
+
+        # reshape back to match original input shape
+        hidden_state_quant = hidden_state_quant.view((batch_size, *self.quant_state_dims, emb_dim))
+        hidden_state_quant = hidden_state_quant.permute(0, 3, 1, 2).contiguous()
+
+        return hidden_state_quant
 
 
-class ChameleonVQModelEncoderConvDownsample(nn.Module):
+class ChameleonVQVAEDecoderConvUpsample(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, hidden_states):
+        hidden_states = F.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+        hidden_states = self.conv(hidden_states)
+        return hidden_states
+
+
+class ChameleonVQVAEEncoderConvDownsample(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
@@ -881,7 +884,7 @@ class ChameleonVQModelEncoderConvDownsample(nn.Module):
         return hidden_states
 
 
-class ChameleonVQModelEncoderResnetBlock(nn.Module):
+class ChameleonVQVAEResnetBlock(nn.Module):
     def __init__(
         self,
         config,
@@ -925,7 +928,7 @@ class ChameleonVQModelEncoderResnetBlock(nn.Module):
         return residual + hidden_states
 
 
-class ChameleonVQModelEncoderAttnBlock(nn.Module):
+class ChameleonVQVAEAttnBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.in_channels = in_channels
@@ -936,7 +939,7 @@ class ChameleonVQModelEncoderAttnBlock(nn.Module):
         self.v = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.proj_out = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.FloatTensor) -> torch.FloatTensor:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         query_states = self.q(hidden_states)
@@ -960,7 +963,7 @@ class ChameleonVQModelEncoderAttnBlock(nn.Module):
         return residual + attn_output
 
 
-class ChameleonVQModelEncoder(nn.Module):
+class ChameleonVQVAEEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -969,8 +972,8 @@ class ChameleonVQModelEncoder(nn.Module):
         base_channels = config.base_channels
         resolution = config.resolution
         in_channels = config.in_channels
-        double_z = config.double_z
-        z_channels = config.z_channels
+        double_latent = config.double_latent
+        latent_channels = config.latent_channels
         channel_multiplier = config.channel_multiplier
 
         self.conv_in = torch.nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1)
@@ -986,7 +989,7 @@ class ChameleonVQModelEncoder(nn.Module):
             block_out = base_channels * channel_multiplier[i_level]
             for i_block in range(self.num_res_blocks):
                 block.append(
-                    ChameleonVQModelEncoderResnetBlock(
+                    ChameleonVQVAEResnetBlock(
                         config=config,
                         in_channels=block_in,
                         out_channels=block_out,
@@ -998,26 +1001,24 @@ class ChameleonVQModelEncoder(nn.Module):
                     and curr_res in config.attn_resolutions
                     and config.attn_type == "vanilla"
                 ):
-                    attn.append(ChameleonVQModelEncoderAttnBlock(block_in))
+                    attn.append(ChameleonVQVAEAttnBlock(block_in))
 
             down = nn.Module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions - 1:
-                down.downsample = ChameleonVQModelEncoderConvDownsample(block_in)
+                down.downsample = ChameleonVQVAEEncoderConvDownsample(block_in)
                 curr_res = curr_res // 2
             self.down.append(down)
 
         self.mid = nn.Module()
-        self.mid.block_1 = ChameleonVQModelEncoderResnetBlock(
+        self.mid.block_1 = ChameleonVQVAEResnetBlock(
             config=config,
             in_channels=block_in,
             out_channels=block_in,
         )
-        self.mid.attn_1 = (
-            ChameleonVQModelEncoderAttnBlock(block_in) if config.attn_type == "vanilla" else nn.Identity()
-        )
-        self.mid.block_2 = ChameleonVQModelEncoderResnetBlock(
+        self.mid.attn_1 = ChameleonVQVAEAttnBlock(block_in) if config.attn_type == "vanilla" else nn.Identity()
+        self.mid.block_2 = ChameleonVQVAEResnetBlock(
             config=config,
             in_channels=block_in,
             out_channels=block_in,
@@ -1026,13 +1027,13 @@ class ChameleonVQModelEncoder(nn.Module):
         self.norm_out = torch.nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
         self.conv_out = torch.nn.Conv2d(
             block_in,
-            2 * z_channels if double_z else z_channels,
+            2 * latent_channels if double_latent else latent_channels,
             kernel_size=3,
             stride=1,
             padding=1,
         )
 
-    def forward(self, pixel_values: torch.LongTensor):
+    def forward(self, pixel_values: torch.FloatTensor) -> torch.FloatTensor:
         # downsampling
         hidden_states = [self.conv_in(pixel_values)]
         for i_level in range(self.num_resolutions):
@@ -1059,26 +1060,187 @@ class ChameleonVQModelEncoder(nn.Module):
         return last_hidden_state
 
 
-class ChameleonVQModel(nn.Module):
-    """
-    A Vector Quantizer model for encoding/decoding images into discrete tokens.
-    """
-
+class ChameleonVQVAEDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.config = config
-        self.encoder = ChameleonVQModelEncoder(config)
-        self.quantize = ChameleonVQModelVectorQuantizer(config)
-        self.quant_conv = torch.nn.Conv2d(config.z_channels, config.embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(config.embed_dim, config.z_channels, 1)
+        self.num_resolutions = len(config.channel_multiplier)
+        self.num_res_blocks = config.num_res_blocks
+        base_channels = config.base_channels
+        resolution = config.resolution
+        latent_channels = config.latent_channels
+        out_channels = config.out_channels
+
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        block_in = base_channels * config.channel_multiplier[self.num_resolutions - 1]
+        curr_res = resolution // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, latent_channels, curr_res, curr_res)
+
+        # z to block_in
+        self.conv_in = torch.nn.Conv2d(latent_channels, block_in, kernel_size=3, stride=1, padding=1)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ChameleonVQVAEResnetBlock(
+            config=config,
+            in_channels=block_in,
+            out_channels=block_in,
+        )
+        self.mid.attn_1 = ChameleonVQVAEAttnBlock(block_in) if config.attn_type == "vanilla" else nn.Identity()
+        self.mid.block_2 = ChameleonVQVAEResnetBlock(
+            config=config,
+            in_channels=block_in,
+            out_channels=block_in,
+        )
+
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = base_channels * config.channel_multiplier[i_level]
+            for i_block in range(self.num_res_blocks + 1):
+                block.append(
+                    ChameleonVQVAEResnetBlock(
+                        config=config,
+                        in_channels=block_in,
+                        out_channels=block_out,
+                    )
+                )
+                block_in = block_out
+                if (
+                    config.attn_resolutions is not None
+                    and curr_res in config.attn_resolutions
+                    and config.attn_type == "vanilla"
+                ):
+                    attn.append(ChameleonVQVAEAttnBlock(block_in))
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = ChameleonVQVAEDecoderConvUpsample(block_in)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)  # prepend to get consistent order
+
+        # end
+        self.norm_out = torch.nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.conv_out = torch.nn.Conv2d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, hidden_state: torch.FloatTensor) -> torch.FloatTensor:
+        hidden_state = self.conv_in(hidden_state)
+
+        # middle
+        hidden_state = self.mid.block_1(hidden_state)
+        hidden_state = self.mid.attn_1(hidden_state)
+        hidden_state = self.mid.block_2(hidden_state)
+
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks + 1):
+                hidden_state = self.up[i_level].block[i_block](hidden_state)
+                if len(self.up[i_level].attn) > 0:
+                    hidden_state = self.up[i_level].attn[i_block](hidden_state)
+            if i_level != 0:
+                hidden_state = self.up[i_level].upsample(hidden_state)
+
+        hidden_state = self.norm_out(hidden_state)
+        hidden_state *= torch.sigmoid(hidden_state)
+        hidden_state = self.conv_out(hidden_state)
+        return hidden_state
+
+
+CHAMELEON_VQ_START_DOCSTRING = r"""
+    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
+    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
+    etc.)
+
+    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
+    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
+    and behavior.
+
+    Parameters:
+        config ([`ChameleonVQVAEConfig`]):
+            Model configuration class with all the parameters of the model. Initializing with a config file does not
+            load the weights associated with the model, only the configuration. Check out the
+            [`~PreTrainedModel.from_pretrained`] method to load the model weights.
+"""
+
+
+@add_start_docstrings(
+    """The VQ-VAE model used in Chameleon for encoding/decoding images into discrete tokens.
+    This model follows the "Make-a-scene: Scene-based text-to-image generation with human priors" paper from
+    [ Oran Gafni, Adam Polyak, Oron Ashual, Shelly Sheynin, Devi Parikh, and Yaniv Taigman](https://arxiv.org/abs/2203.13131).
+    """,
+    CHAMELEON_VQ_START_DOCSTRING,
+)
+class ChameleonVQVAE(PreTrainedModel):
+    config_class = ChameleonVQVAEConfig
+    _no_split_modules = ["ChameleonVQVAEVectorQuantizer"]
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+        elif isinstance(module, nn.GroupNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        elif isinstance(module, (nn.Linear, nn.Conv2d)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+    def __init__(self, config: ChameleonVQVAEConfig):
+        super().__init__(config)
+
+        self.encoder = ChameleonVQVAEEncoder(config)
+        self.decoder = ChameleonVQVAEDecoder(config)
+        self.quantize = ChameleonVQVAEVectorQuantizer(config)
+        self.quant_conv = torch.nn.Conv2d(config.latent_channels, config.embed_dim, 1)
+        self.post_quant_conv = torch.nn.Conv2d(config.embed_dim, config.latent_channels, 1)
         self.eval()  # Chameleon's VQ model is frozen
 
-    def encode(self, pixel_values: torch.LongTensor):
+    def encode(self, pixel_values: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.LongTensor]:
+        """
+        Encodes pixel values into quantized tokens.
+
+        Args:
+            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)):
+                The tensors corresponding to the input images.
+
+        Returns:
+            quant (`torch.FloatTensor` of shape `(batch_size, embed_dim, quantize.quant_state_dims[0], quantize.quant_state_dims[1])`):
+                Embeddings of quantized tokens.
+            emb_loss (`torch.FloatTensor`):
+                Embedding loss.
+            indices (`torch.LongTensor` of shape `(batch_size, quantize.quant_state_dims[0] * quantize.quant_state_dims[1])`):
+                Token IDs
+        """
         hidden_states = self.encoder(pixel_values)
         hidden_states = self.quant_conv(hidden_states)
         quant, emb_loss, indices = self.quantize(hidden_states)
         return quant, emb_loss, indices
+
+    def decode(self, image_tokens: torch.LongTensor) -> torch.FloatTensor:
+        """
+        Decodes quantized token IDs into pixel values.
+
+        Args:
+            image_tokens (`torch.LongTensor` of shape `(batch_size, quantize.quant_state_dims[0] * quantize.quant_state_dims[1])`):
+                Batch of token IDs.
+
+        Returns:
+            (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                Pixel values decoded from the token IDs.
+        """
+        if image_tokens.shape[1] != self.quantize.quant_state_dims[0] * self.quantize.quant_state_dims[1]:
+            raise ValueError(
+                f"Expected `image_tokens` to have shape `(batch_size, {self.quantize.quant_state_dims[0] * self.quantize.quant_state_dims[1]})`, "
+                f"but got shape `{image_tokens.shape}`."
+            )
+        codebook_entry = self.quantize.get_codebook_entry(image_tokens)
+        hidden_states = self.post_quant_conv(codebook_entry)
+        pixel_values = self.decoder(hidden_states)
+        return pixel_values
 
 
 class ChameleonImageVocabularyMapping:
@@ -1086,16 +1248,24 @@ class ChameleonImageVocabularyMapping:
     A class for mapping discrete image tokens from VQGAN to BPE tokens.
     """
 
-    def __init__(self, vocab_map):
+    def __init__(
+        self,
+        vocab_map: Dict[str, int],
+        image_token_id: int,
+        boi_token_id: int,
+        eoi_token_id: int,
+    ):
         self.vocab_map = vocab_map
-        self.image_token_id = vocab_map.get("<image>")
+        self.image_token_id = image_token_id
+        self.boi_token_id = boi_token_id
+        self.eoi_token_id = eoi_token_id
 
     @cached_property
     def val2name(self):
         return {v: k for k, v in self.vocab_map.items()}
 
     @cached_property
-    def image_tokens(self):
+    def image_token_ids(self):
         return sorted([val for name, val in self.vocab_map.items() if name.startswith("IMGIMG")])
 
     @cached_property
@@ -1105,15 +1275,18 @@ class ChameleonImageVocabularyMapping:
         def remap(old_name: str) -> str:
             return "".join(img_tkn_chr_mapping.get(c, c) for c in old_name[len("IMGIMG") : -1])
 
-        return {tok: int(remap(self.val2name[tok])) for tok in self.image_tokens}
+        return {tok: int(remap(self.val2name[tok])) for tok in self.image_token_ids}
 
     @cached_property
     def img2bpe(self):
         return {v: k for k, v in self.bpe2img.items()}
 
     @cached_property
-    def bpe2img_search_tensors(self):
-        return torch.tensor(sorted(self.bpe2img.keys())), torch.tensor(sorted(self.bpe2img.values()))
+    def bpe2img_mapping_tensor(self):
+        mapping = torch.zeros(max(self.bpe2img.keys()) + 1, dtype=torch.int)
+        for k, v in self.bpe2img.items():
+            mapping[k] = v
+        return mapping
 
     @cached_property
     def img2bpe_mapping_tensor(self):
@@ -1121,11 +1294,6 @@ class ChameleonImageVocabularyMapping:
         for k, v in self.img2bpe.items():
             mapping[k] = v
         return mapping
-
-    def convert_img2bpe(self, img_batch: torch.Tensor) -> torch.Tensor:
-        device = img_batch.device
-        img_tokens = self.img2bpe_mapping_tensor[img_batch.to("cpu")]
-        return img_tokens.to(device)
 
 
 CHAMELEON_START_DOCSTRING = r"""
@@ -1153,17 +1321,20 @@ class ChameleonPreTrainedModel(PreTrainedModel):
     config_class = ChameleonConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["ChameleonDecoderLayer"]
+    _no_split_modules = ["ChameleonDecoderLayer", "ChameleonSwinDecoderLayer", "ChameleonVQVAE"]
     _skip_keys_device_placement = ["past_key_values", "causal_mask"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     _supports_quantized_cache = True
     _supports_cache_class = True
     _supports_static_cache = True
+    _supports_param_buffer_assignment = False
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module, ChameleonVQVAE):
+            module.apply(module._init_weights)
+        elif isinstance(module, (nn.Linear, nn.Conv2d)):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -1211,20 +1382,12 @@ CHAMELEON_INPUTS_DOCSTRING = r"""
             config.n_positions - 1]`.
 
             [What are position IDs?](../glossary#position-ids)
-        past_key_values (`Cache` or `tuple(tuple(torch.FloatTensor))`, *optional*):
+        past_key_values (`Cache`, *optional*):
             Pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used to speed up sequential decoding. This typically consists in the `past_key_values`
             returned by the model at a previous stage of decoding, when `use_cache=True` or `config.use_cache=True`.
 
-            Two formats are allowed:
-            - a [`~cache_utils.Cache`] instance;
-            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
-            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
-            cache format.
-
-            The model will output the same cache format that is fed as input. If no `past_key_values` are passed, the
-            legacy cache format will be returned.
-
+            Should always be a [`~cache_utils.Cache`] instance and the model will output the same cache instance.
             If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
             have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
             of shape `(batch_size, sequence_length)`.
@@ -1268,23 +1431,91 @@ class ChameleonModel(ChameleonPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.vocabulary_mapping = ChameleonImageVocabularyMapping(config.vocabulary_map)
+        self.vocabulary_mapping = ChameleonImageVocabularyMapping(
+            config.vocabulary_map,
+            config.image_token_id,
+            config.boi_token_id,
+            config.eoi_token_id,
+        )
+        self.register_buffer(
+            "img2bpe_mapping_tensor",
+            self.vocabulary_mapping.img2bpe_mapping_tensor,
+            persistent=False,
+        )
+        self.register_buffer(
+            "bpe2img_mapping_tensor",
+            self.vocabulary_mapping.bpe2img_mapping_tensor,
+            persistent=False,
+        )
         decoder_layer = ChameleonDecoderLayer if not self.config.swin_norm else ChameleonSwinDecoderLayer
         self.layers = nn.ModuleList(
             [decoder_layer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = ChameleonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.vqmodel = ChameleonVQModel(config.vq_config)
+        self.vqmodel = ChameleonVQVAE(config.vq_config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @property
+    def image_seq_length(self) -> int:
+        return self.vqmodel.quantize.quant_state_dims[0] * self.vqmodel.quantize.quant_state_dims[1]
 
     def get_input_embeddings(self):
         return self.embed_tokens
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def convert_img2bpe_tokens(self, img_batch: torch.LongTensor) -> torch.LongTensor:
+        """
+        Converts image tokens generated by the VQVAE model into BPE tokens compatible with the text tokenizer.
+
+        Notes:
+            - It is important to move the `img_batch` tensor to the same device as the `img2bpe_mapping_tensor` buffer
+            as Accelerate may move the buffer to a different device when loading the model with `device_map="auto"`.
+            - Accelerate up to version 0.33.0 (and also maybe later versions) has a bug where buffers in downstream modules
+            may be ignored when inferring the proper device map. See: https://github.com/huggingface/accelerate/blob/79ca85c27df292dbf64cfa2bcc12dbb62fbe9267/src/accelerate/utils/modeling.py#L1273
+            This causes the `img2bpe_mapping_tensor` buffer to be placed on the CPU by default, which may cause a performance
+            loss--especially with prompts that contain many images. No action needs to be done when this bug is fixed.
+
+        Args:
+            img_batch (`torch.Tensor` of shape `(batch_size, image_seq_length)`):
+                The image tokens generated by the VQVAE model.
+
+        Returns:
+            `torch.Tensor` of shape `(batch_size, image_seq_length)`:
+                The image tokens converted to be compatible with the text tokenizer's BPE tokens.
+        """
+        device = img_batch.device
+        img_tokens = self.img2bpe_mapping_tensor[img_batch.to(self.img2bpe_mapping_tensor.device)]
+        return img_tokens.to(device)
+
+    def convert_bpe2img_tokens(self, bpe_batch: torch.LongTensor) -> torch.LongTensor:
+        """
+        Converts image tokens that are compatible with the text tokenizer into image tokens compatible with the VQVAE
+        model.
+
+        Notes:
+            - It is important to move the `img_batch` tensor to the same device as the `img2bpe_mapping_tensor` buffer
+            as Accelerate may move the buffer to a different device when loading the model with `device_map="auto"`.
+            - Accelerate up to version 0.33.0 (and also maybe later versions) has a bug where buffers in downstream modules
+            may be ignored when inferring the proper device map. See: https://github.com/huggingface/accelerate/blob/79ca85c27df292dbf64cfa2bcc12dbb62fbe9267/src/accelerate/utils/modeling.py#L1273
+            This causes the `img2bpe_mapping_tensor` buffer to be placed on the CPU by default, which may cause a performance
+            loss--especially when generating interleaved text & images. No action needs to be done when this bug is fixed.
+
+        Args:
+            bpe_batch (`torch.Tensor` of shape `(batch_size, image_seq_length)`):
+                The image tokens compatible with the text tokenizer.
+
+        Returns:
+            `torch.Tensor` of shape `(batch_size, image_seq_length)`:
+                The image tokens converted to be compatible with the VQVAE model.
+        """
+        device = bpe_batch.device
+        img_tokens = self.bpe2img_mapping_tensor[bpe_batch.to(self.bpe2img_mapping_tensor.device)]
+        return img_tokens.to(device)
 
     def get_image_tokens(self, pixel_values: torch.FloatTensor):
         """
@@ -1295,12 +1526,30 @@ class ChameleonModel(ChameleonPreTrainedModel):
         Args:
             pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)):
                 The tensors corresponding to the input images.
+
+        Returns:
+            `torch.Tensor` of shape `(batch_size, image_seq_length)`:
+                The BPE tokens generated by the model.
         """
-        batch_size = pixel_values.shape[0]
         _, _, image_toks = self.vqmodel.encode(pixel_values)
-        bpe_toks = self.vocabulary_mapping.convert_img2bpe(image_toks)
-        bpe_toks = bpe_toks.view(batch_size, -1)
-        return bpe_toks
+        return self.convert_img2bpe_tokens(image_toks)
+
+    def decode_image_tokens(self, bpe_tokens: torch.LongTensor) -> torch.LongTensor:
+        """
+        Converts BPE tokens generated by the model into discrete image tokens
+        compatible with the VQGAN module, then decodes them into pixel values.
+
+        Args:
+            bpe_tokens (`torch.tensor` of shape `(batch, image_seq_length)`):
+                The BPE tokens generated by the model.
+
+        Returns:
+            `torch.Tensor` of shape `(batch, num_channels, 512, 512)`:
+        """
+        if bpe_tokens.shape[1] != self.image_seq_length:
+            raise ValueError(f"All batches must have {self.image_seq_length} tokens.")
+        image_tensor = self.convert_bpe2img_tokens(bpe_tokens)
+        return self.vqmodel.decode(image_tensor)
 
     @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -1315,7 +1564,7 @@ class ChameleonModel(ChameleonPreTrainedModel):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1349,22 +1598,14 @@ class ChameleonModel(ChameleonPreTrainedModel):
         if pixel_values is not None:
             image_tokens = self.get_image_tokens(pixel_values)
             special_image_mask = input_ids == self.vocabulary_mapping.image_token_id
-            input_ids[special_image_mask] = image_tokens.flatten().to(input_ids.device, input_ids.dtype)
+            image_tokens = image_tokens.to(input_ids.device, input_ids.dtype)
+            input_ids = input_ids.masked_scatter(special_image_mask, image_tokens)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        use_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
-            use_legacy_cache = True
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            logger.warning_once(
-                "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
-                "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
-            )
-
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if use_cache else 0
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1426,7 +1667,7 @@ class ChameleonModel(ChameleonPreTrainedModel):
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+            next_cache = next_decoder_cache
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -1485,27 +1726,18 @@ class ChameleonModel(ChameleonPreTrainedModel):
                 else past_seen_tokens + sequence_length + 1
             )
 
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # in this case we assume that the mask comes already in inverted form and requires no inversion or slicing
-            if attention_mask.max() != 0:
-                raise ValueError("Custom 4D attention mask should be passed in inverted form with max==0`")
-            causal_mask = attention_mask
-        else:
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        causal_mask = _prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            device=device,
+            min_dtype=min_dtype,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+        )
+
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
@@ -1524,12 +1756,13 @@ class ChameleonModel(ChameleonPreTrainedModel):
     "Chameleon Model with a head on top used for outputting logits for next token prediction.",
     CHAMELEON_START_DOCSTRING,
 )
-class ChameleonForCausalLM(ChameleonPreTrainedModel):
+class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config: ChameleonConfig):
         super().__init__(config)
         self.model = ChameleonModel(config)
+        self.vocabulary_mapping = self.model.vocabulary_mapping
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1554,6 +1787,169 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
     def get_decoder(self):
         return self.model
 
+    def _prepare_generation_config(
+        self,
+        generation_config: Optional[GenerationConfig] = None,
+        multimodal_generation_mode: Optional[
+            Literal["text-only", "image-only", "interleaved-text-image", "unrestricted"]
+        ] = None,
+        **kwargs,
+    ):
+        if (
+            multimodal_generation_mode == "image-only"
+            and kwargs.get("max_length") is None
+            and kwargs.get("max_new_tokens") is None
+            and (
+                generation_config is None
+                or (generation_config.max_length is None and generation_config.max_new_tokens is None)
+            )
+        ):
+            kwargs["max_new_tokens"] = self.model.image_seq_length + 2
+        generation_config, model_kwargs = super()._prepare_generation_config(generation_config, **kwargs)
+        if multimodal_generation_mode is not None:
+            generation_config.multimodal_generation_mode = multimodal_generation_mode
+        if (
+            not hasattr(generation_config, "multimodal_generation_mode")
+            or generation_config.multimodal_generation_mode is None
+        ):
+            generation_config.multimodal_generation_mode = "text-only"
+        return generation_config, model_kwargs
+
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        multimodal_generation_mode: Optional[
+            Literal["text-only", "image-only", "interleaved-text-image", "unrestricted"]
+        ] = None,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        generation_config, model_kwargs = self._prepare_generation_config(
+            generation_config, multimodal_generation_mode, **kwargs
+        )
+
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
+            inputs, generation_config.bos_token_id, model_kwargs
+        )
+        input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+
+        # Prepare `max_length` depending on other stopping criteria.
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            has_default_min_length=has_default_min_length,
+            model_input_name=model_input_name,
+            inputs_tensor=inputs_tensor,
+            input_ids_length=input_ids_length,
+        )
+
+        if logits_processor is None:
+            logits_processor = LogitsProcessorList()
+        if generation_config.multimodal_generation_mode == "text-only":
+            logits_processor.append(
+                SuppressTokensLogitsProcessor(
+                    suppress_tokens=self.vocabulary_mapping.image_token_ids
+                    + [
+                        self.vocabulary_mapping.boi_token_id,
+                        self.vocabulary_mapping.eoi_token_id,
+                    ],
+                    device=self.device,
+                )
+            )
+        elif generation_config.multimodal_generation_mode == "image-only":
+            inferred_max_new_tokens = generation_config.max_length - input_ids_length
+            if inferred_max_new_tokens < self.model.image_seq_length + 2:
+                warnings.warn(
+                    f"The VQVAE decoder expects to receive {self.model.image_seq_length} image tokens to generate an image."
+                    "And Chameleon wraps the image tokens with the `beginning-of-image` and `end-of-image` tokens when on image generation mode."
+                    f"Therefore, the `max_new_tokens` must be at least {self.model.image_seq_length + 2}."
+                    f"However, the inferred `max_new_tokens` from the generation config is only {inferred_max_new_tokens}."
+                    "You would need to pad the output tokens with dummy image tokens before passing them to the VQVAE decoder."
+                    f"To avoid this warning, set `max_new_tokens` to at least {self.model.image_seq_length + 2}."
+                )
+            allowed_tokens = self.vocabulary_mapping.image_token_ids + [
+                self.config.eos_token_id,
+                self.vocabulary_mapping.boi_token_id,
+                self.vocabulary_mapping.eoi_token_id,
+            ]
+            suppress_tokens = [token_id for token_id in range(self.vocab_size) if token_id not in allowed_tokens]
+            logits_processor.extend(
+                [
+                    AllowOnlyTokensAtRelativeOffsetLogitsProcessor(
+                        trigger_token_id=self.vocabulary_mapping.boi_token_id,
+                        allowed_token_ids=[self.vocabulary_mapping.eoi_token_id],
+                        offset=self.model.image_seq_length + 1,
+                        exclusive=True,
+                        device=self.device,
+                    ),
+                    AllowOnlyTokensInRelativeWindowLogitsProcessor(
+                        trigger_token_id=self.vocabulary_mapping.boi_token_id,
+                        allowed_token_ids=self.vocabulary_mapping.image_token_ids,
+                        window_width=self.model.image_seq_length,
+                        exclusive=True,
+                        device=self.device,
+                    ),
+                    # Don't start generating an image if there aren't enough space for the
+                    # rest of the image tokens.
+                    SuppressTokensInIndexRangeLogitsProcessor(
+                        suppress_tokens=[self.vocabulary_mapping.boi_token_id],
+                        start_index=generation_config.max_length - self.model.image_seq_length - 1,
+                        device=self.device,
+                    ),
+                    # Allow only image tokens
+                    SuppressTokensLogitsProcessor(suppress_tokens=suppress_tokens, device=self.device),
+                    # Force image generation
+                    SuppressTokensAtBeginLogitsProcessor(
+                        begin_suppress_tokens=[self.config.eos_token_id],
+                        begin_index=input_ids_length,
+                        device=self.device,
+                    ),
+                ]
+            )
+        elif generation_config.multimodal_generation_mode == "interleaved-text-image":
+            logits_processor.extend(
+                [
+                    AllowOnlyTokensAtRelativeOffsetLogitsProcessor(
+                        trigger_token_id=self.vocabulary_mapping.boi_token_id,
+                        allowed_token_ids=[self.vocabulary_mapping.eoi_token_id],
+                        offset=self.model.image_seq_length + 1,
+                        exclusive=True,
+                        device=self.device,
+                    ),
+                    AllowOnlyTokensInRelativeWindowLogitsProcessor(
+                        trigger_token_id=self.vocabulary_mapping.boi_token_id,
+                        allowed_token_ids=self.vocabulary_mapping.image_token_ids,
+                        window_width=self.model.image_seq_length,
+                        exclusive=True,
+                        device=self.device,
+                    ),
+                    # Don't start generating an image if there aren't enough space for the
+                    # rest of the image tokens.
+                    SuppressTokensInIndexRangeLogitsProcessor(
+                        suppress_tokens=[self.vocabulary_mapping.boi_token_id],
+                        start_index=generation_config.max_length - self.model.image_seq_length - 1,
+                        device=self.device,
+                    ),
+                ]
+            )
+        elif generation_config.multimodal_generation_mode == "unrestricted":
+            pass
+        else:
+            raise ValueError(
+                f"Unknown multimodal generation mode: {generation_config.multimodal_generation_mode}. Please choose one of 'unrestricted', 'text-only', 'image-only', or 'interleaved-text-image'."
+            )
+        return super().generate(
+            inputs=inputs,
+            generation_config=generation_config,
+            logits_processor=logits_processor,
+            **kwargs,
+        )
+
     @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1562,7 +1958,7 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
         pixel_values: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1583,20 +1979,21 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import ChameleonProcessor, ChameleonForCausalLM
+        >>> from transformers import ChameleonProcessor, ChameleonForConditionalGeneration
         >>> import torch
         >>> import requests
         >>> from PIL import Image
 
-        >>> model = ChameleonForCausalLM.from_pretrained("meta-chameleon/meta-chameleon/chameleon-hf")
-        >>> processor = ChameleonProcessor.from_pretrained("meta-chameleon/meta-chameleon/chameleon-hf")
+        >>> model = ChameleonForConditionalGeneration.from_pretrained("facebook/chameleon-7b", torch_dtype=torch.bfloat16)
+        >>> processor = ChameleonProcessor.from_pretrained("facebook/chameleon-7b")
 
+        >>> prompt = "I used to know a lot about constellations when I was younger, but as I grew older, I forgot most of what I knew. These are the only two constellations that I really remember now.<image><image>I would like for you to tell me about 3 more constellations and give me a little bit of history about the constellation."
         >>> image = Image.open(requests.get("https://nineplanets.org/wp-content/uploads/2020/12/the-big-dipper-1.jpg", stream=True).raw)
         >>> image_2 = Image.open(requests.get("https://www.kxan.com/wp-content/uploads/sites/40/2020/10/ORION.jpg", stream=True).raw)
-        >>> prompt = "What do these two images have in common?<image><image>"
-        >>> inputs = processor(prompt, images=[image, image_2], return_tensors="pt").to(model.device, torch.float16)
 
-        >>> generated_ids = model.generate(**inputs, max_new_tokens=40, do_sample=False)
+        >>> inputs = processor(prompt, images=[image, image_2], return_tensors="pt").to(model.device, torch.bfloat16)
+
+        >>> generated_ids = model.generate(**inputs, max_new_tokens=100, do_sample=False)
         >>> processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1623,10 +2020,6 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits = logits.float()
-
-        # Disallow image tokens which does not include special begin-image and end-image tokens
-        image_tokens = self.model.vocabulary_mapping.image_tokens
-        logits[:, :, image_tokens] = torch.finfo(logits.dtype).min
 
         loss = None
         if labels is not None:
@@ -1661,40 +2054,19 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
         attention_mask=None,
         inputs_embeds=None,
         cache_position=None,
+        position_ids=None,
         use_cache=True,
         **kwargs,
     ):
-        past_length = 0
+        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
+        # Exception 1: when passing input_embeds, input_ids may be missing entries
+        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
         if past_key_values is not None:
-            # Past key values are always initialized with a `Cache` object -> no need for if-else anymore
-            past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
-            max_cache_length = (
-                torch.tensor(past_key_values.get_max_length(), device=input_ids.device)
-                if past_key_values.get_max_length() is not None
-                else None
-            )
-            cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
+            if inputs_embeds is not None:  # Exception 1
+                input_ids = input_ids[:, -cache_position.shape[0] :]
+            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+                input_ids = input_ids[:, cache_position]
 
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-            if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
-            ):
-                attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
@@ -1703,24 +2075,15 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
                 position_ids = position_ids[:, -input_ids.shape[1] :]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_length == 0:
+        if inputs_embeds is not None and cache_position[0] == 0:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
-            # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
-            # TODO: use `next_tokens` directly instead.
-            model_inputs = {"input_ids": input_ids.contiguous()}
+            model_inputs = {"input_ids": input_ids.contiguous()}  # `contiguous()` needed for compilation use cases
 
-        if past_length == 0:
+        if cache_position[0] == 0:
             # If we're in cached decoding stage, pixel values should be `None` because input ids do not contain special image token anymore
             # Otherwise we need pixel values to be passed to model
             model_inputs["pixel_values"] = pixel_values
-
-        input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
-        if cache_position is None:
-            cache_position = torch.arange(past_length, past_length + input_length, device=input_ids.device)
-        elif use_cache:
-            cache_position = cache_position[-input_length:]
 
         model_inputs.update(
             {
@@ -1733,254 +2096,16 @@ class ChameleonForCausalLM(ChameleonPreTrainedModel):
         )
         return model_inputs
 
-    @staticmethod
-    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM._reorder_cache
-    def _reorder_cache(past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
-            )
-        return reordered_past
-
-
-@add_start_docstrings(
-    """
-    The Chameleon Model transformer with a sequence classification head on top (linear layer).
-
-    [`ChameleonForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-2) do.
-
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    CHAMELEON_START_DOCSTRING,
-)
-# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Chameleon, LLAMA->CHAMELEON
-class ChameleonForSequenceClassification(ChameleonPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = ChameleonModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=SequenceClassifierOutputWithPast,
-        expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
-        expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
-    )
-    # Ignore copy
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+    def decode_image_tokens(self, bpe_tokens: torch.Tensor):
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        Converts BPE tokens generated by the model into discrete image tokens
+        compatible with the VQGAN module, then decodes them into pixel values.
 
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
-        hidden_states = transformer_outputs[0]
-        logits = self.score(hidden_states)
+        Args:
+            bpe_tokens (`torch.tensor` of shape `(batch, image_seq_length)`):
+                The BPE tokens generated by the model.
 
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-                sequence_lengths = sequence_lengths.to(logits.device)
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
-
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
-        if not return_dict:
-            output = (pooled_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-The Chameleon Model transformer with a span classification head on top for extractive question-answering tasks like
-SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
-    """,
-    CHAMELEON_START_DOCSTRING,
-)
-class ChameleonForQuestionAnswering(ChameleonPreTrainedModel):
-    # Copied from transformers.models.llama.modeling_llama.LlamaForQuestionAnswering.__init__ with Llama->Chameleon
-    def __init__(self, config):
-        super().__init__(config)
-        self.transformer = ChameleonModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.transformer.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.transformer.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=QuestionAnsweringModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    # Ignore copy
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
+        Returns:
+            `torch.Tensor` of shape `(batch, num_channels, 512, 512)`:
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
-
-        sequence_output = outputs[0]
-
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1).contiguous()
-        end_logits = end_logits.squeeze(-1).contiguous()
-
-        total_loss = None
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1).to(start_logits.device)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1).to(end_logits.device)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions = start_positions.clamp(0, ignored_index)
-            end_positions = end_positions.clamp(0, ignored_index)
-
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((total_loss,) + output) if total_loss is not None else output
-
-        return QuestionAnsweringModelOutput(
-            loss=total_loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return self.model.decode_image_tokens(bpe_tokens)

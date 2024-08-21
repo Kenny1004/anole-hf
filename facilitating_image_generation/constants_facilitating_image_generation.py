@@ -28,7 +28,7 @@ DATASET_IMAGE_PATH = Path("./images/")
 CHAMELEON_PATH_TORCH = Path("/path/to/your/meta-chameleon/")
 
 # Chameleon HF path (specify the path that you want to store your chameleon hugging face checkpoint)
-CHAMELEON_PATH_HF = Path("./model/meta-chameleon-hf/")
+CHAMELEON_PATH_HF = Path("/home/zlhu/data2/zlhu/anole/facilitating_image_generation/old-chameleon")
 
 # Anole torch path (specify the path that you want to store your Anole torch checkpoint)
 ANOLE_PATH_TORCH = Path("./model/anole/")

@@ -24,7 +24,7 @@ from ...utils import (
 
 
 _import_structure = {
-    "configuration_chameleon": ["ChameleonConfig", "ChameleonVQConfig"],
+    "configuration_chameleon": ["ChameleonConfig", "ChameleonVQVAEConfig"],
     "processing_chameleon": ["ChameleonProcessor"],
 }
 
@@ -36,11 +36,10 @@ except OptionalDependencyNotAvailable:
     pass
 else:
     _import_structure["modeling_chameleon"] = [
-        "ChameleonForCausalLM",
+        "ChameleonForConditionalGeneration",
         "ChameleonModel",
         "ChameleonPreTrainedModel",
-        "ChameleonForSequenceClassification",
-        "ChameleonForQuestionAnswering",
+        "ChameleonVQVAE",
     ]
 
 try:
@@ -53,7 +52,7 @@ else:
 
 
 if TYPE_CHECKING:
-    from .configuration_chameleon import ChameleonConfig, ChameleonVQConfig
+    from .configuration_chameleon import ChameleonConfig, ChameleonVQVAEConfig
     from .processing_chameleon import ChameleonProcessor
 
     try:
@@ -63,11 +62,10 @@ if TYPE_CHECKING:
         pass
     else:
         from .modeling_chameleon import (
-            ChameleonForCausalLM,
-            ChameleonForQuestionAnswering,
-            ChameleonForSequenceClassification,
+            ChameleonForConditionalGeneration,
             ChameleonModel,
             ChameleonPreTrainedModel,
+            ChameleonVQVAE,
         )
 
     try:

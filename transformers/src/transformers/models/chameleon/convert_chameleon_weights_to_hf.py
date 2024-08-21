@@ -24,7 +24,7 @@ from PIL import Image
 
 from transformers import (
     ChameleonConfig,
-    ChameleonForCausalLM,
+    ChameleonForConditionalGeneration,
     ChameleonImageProcessor,
     ChameleonProcessor,
 )
@@ -49,9 +49,9 @@ python src/transformers/models/chameleon/convert_chameleon_weights_to_hf.py \
 Thereafter, models can be loaded via:
 
 ```py
-from transformers import ChameleonForCausalLM, LlamaTokenizer
+from transformers import ChameleonForConditionalGeneration, LlamaTokenizer
 
-model = ChameleonForCausalLM.from_pretrained("/output/path")
+model = ChameleonForConditionalGeneration.from_pretrained("/output/path")
 tokenizer = LlamaTokenizer.from_pretrained("/output/path")
 ```
 
@@ -81,7 +81,7 @@ def write_json(text, path):
         json.dump(text, f)
 
 
-def write_model(model_path, input_base_path, model_size, chameleon_version=1):
+def write_model(model_path, input_base_path, model_size, chameleon_version=1, vqvae_path=None):
     os.makedirs(model_path, exist_ok=True)
     input_model_path = os.path.join(input_base_path, "models", model_size.lower())
     params_path = os.path.join(input_model_path, "params.json")
@@ -91,6 +91,7 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
     if os.path.isfile(consolidate_params_path):
         params = {**params, **read_json(consolidate_params_path)}
     num_shards = NUM_SHARDS[model_size]
+    model_parallel_size = params["model_parallel_size"]
     params = params.get("model", params)
     n_layers = params["n_layers"]
     n_heads = params["n_heads"]
@@ -98,7 +99,6 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
     dim = params["dim"]
     dims_per_head = dim // n_heads
     base = params.get("rope_theta", 10000.0)
-    qk_layernorm = params["qk_normalization"]
     swin_norm = params["swin_norm"]
     if base > 10000.0:
         max_position_embeddings = 16384
@@ -140,6 +140,10 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
             for i in range(num_shards)
         ]
 
+    # permute for sliced rotary
+    def permute(w, n_heads, dim1=dim, dim2=dim):
+        return w.view(n_heads, dim1 // n_heads // 2, 2, dim2).transpose(1, 2).reshape(dim1, dim2)
+
     # Load weights to the state dict
     state_dict = {}
     for layer_i in range(n_layers):
@@ -147,8 +151,14 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
             # Unsharded
             state_dict.update(
                 {
-                    f"model.layers.{layer_i}.self_attn.q_proj.weight": loaded[f"layers.{layer_i}.attention.wq.weight"],
-                    f"model.layers.{layer_i}.self_attn.k_proj.weight": loaded[f"layers.{layer_i}.attention.wk.weight"],
+                    f"model.layers.{layer_i}.self_attn.q_proj.weight": permute(
+                        loaded[f"layers.{layer_i}.attention.wq.weight"], n_heads=n_heads
+                    ),
+                    f"model.layers.{layer_i}.self_attn.k_proj.weight": permute(
+                        loaded[f"layers.{layer_i}.attention.wk.weight"],
+                        n_heads=num_key_value_heads,
+                        dim1=key_value_dim,
+                    ),
                     f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[f"layers.{layer_i}.attention.wv.weight"],
                     f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[f"layers.{layer_i}.attention.wo.weight"],
                     f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[f"layers.{layer_i}.feed_forward.w1.weight"],
@@ -162,19 +172,35 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
                     ],
                 }
             )
-            if qk_layernorm:
-                state_dict[f"model.layers.{layer_i}.self_attn.q_norm.weight"] = loaded[
-                    f"layers.{layer_i}.attention.q_normalization.weight"
-                ]
-                state_dict[f"model.layers.{layer_i}.self_attn.q_norm.bias"] = loaded[
-                    f"layers.{layer_i}.attention.q_normalization.bias"
-                ]
-                state_dict[f"model.layers.{layer_i}.self_attn.k_norm.weight"] = loaded[
-                    f"layers.{layer_i}.attention.k_normalization.weight"
-                ]
-                state_dict[f"model.layers.{layer_i}.self_attn.k_norm.bias"] = loaded[
-                    f"layers.{layer_i}.attention.k_normalization.bias"
-                ]
+            # qk_layernorm (see https://github.com/huggingface/transformers/pull/31534#issuecomment-2207354677)
+            state_dict[f"model.layers.{layer_i}.self_attn.q_norm.weight"] = (
+                loaded[f"layers.{layer_i}.attention.q_normalization.weight"]
+                .view(dims_per_head // 2, 2)
+                .t()
+                .reshape(1, -1)
+                .repeat_interleave(n_heads, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.q_norm.bias"] = (
+                loaded[f"layers.{layer_i}.attention.q_normalization.bias"]
+                .view(dims_per_head // 2, 2)
+                .t()
+                .reshape(1, -1)
+                .repeat_interleave(n_heads, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.k_norm.weight"] = (
+                loaded[f"layers.{layer_i}.attention.k_normalization.weight"]
+                .view(dims_per_head // 2, 2)
+                .t()
+                .reshape(1, -1)
+                .repeat_interleave(num_key_value_heads, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.k_norm.bias"] = (
+                loaded[f"layers.{layer_i}.attention.k_normalization.bias"]
+                .view(dims_per_head // 2, 2)
+                .t()
+                .reshape(1, -1)
+                .repeat_interleave(num_key_value_heads, 0)
+            )
 
         else:
             # Sharded
@@ -188,37 +214,61 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
                     ).mean(dim=0),
                 }
             )
-            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = torch.cat(
-                [
-                    loaded[i][f"layers.{layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
-                    for i in range(num_shards)
-                ],
-                dim=0,
-            ).reshape(dim, dim)
+            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = permute(
+                torch.cat(
+                    [
+                        loaded[i][f"layers.{layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        for i in range(num_shards)
+                    ],
+                    dim=0,
+                ).reshape(dim, dim),
+                n_heads=n_heads,
+            )
 
-            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.weight"] = torch.cat(
-                [
-                    loaded[i][f"layers.{layer_i}.attention.wk.weight"].view(
-                        num_local_key_value_heads, dims_per_head, dim
-                    )
-                    for i in range(num_shards)
-                ],
-                dim=0,
-            ).reshape(key_value_dim, dim)
+            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.weight"] = permute(
+                torch.cat(
+                    [
+                        loaded[i][f"layers.{layer_i}.attention.wk.weight"].view(
+                            num_local_key_value_heads, dims_per_head, dim
+                        )
+                        for i in range(num_shards)
+                    ],
+                    dim=0,
+                ).reshape(key_value_dim, dim),
+                n_heads=num_key_value_heads,
+                dim1=key_value_dim,
+            )
 
-            if qk_layernorm:
-                state_dict[f"model.layers.{layer_i}.self_attn.q_norm.weight"] = torch.stack(
-                    [l[f"layers.{layer_i}.attention.q_normalization.weight"] for l in loaded]
-                ).mean(dim=0)
-                state_dict[f"model.layers.{layer_i}.self_attn.q_norm.bias"] = torch.stack(
-                    [l[f"layers.{layer_i}.attention.q_normalization.bias"] for l in loaded]
-                ).mean(dim=0)
-                state_dict[f"model.layers.{layer_i}.self_attn.k_norm.weight"] = torch.stack(
-                    [l[f"layers.{layer_i}.attention.k_normalization.weight"] for l in loaded]
-                ).mean(dim=0)
-                state_dict[f"model.layers.{layer_i}.self_attn.k_norm.bias"] = torch.stack(
-                    [l[f"layers.{layer_i}.attention.k_normalization.bias"] for l in loaded]
-                ).mean(dim=0)
+            # qk_layernorm (see https://github.com/huggingface/transformers/pull/31534#issuecomment-2207354677)
+            state_dict[f"model.layers.{layer_i}.self_attn.q_norm.weight"] = (
+                torch.cat([l[f"layers.{layer_i}.attention.q_normalization.weight"].unsqueeze(0) for l in loaded])
+                .view(num_shards, dims_per_head // 2, 2)
+                .transpose(1, 2)
+                .reshape(num_shards, -1)
+                .repeat_interleave(n_heads // num_shards, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.q_norm.bias"] = (
+                torch.cat([l[f"layers.{layer_i}.attention.q_normalization.bias"].unsqueeze(0) for l in loaded])
+                .view(num_shards, dims_per_head // 2, 2)
+                .transpose(1, 2)
+                .reshape(num_shards, -1)
+                .repeat_interleave(n_heads // num_shards, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.k_norm.weight"] = (
+                torch.cat([l[f"layers.{layer_i}.attention.k_normalization.weight"].unsqueeze(0) for l in loaded])
+                .view(num_shards, dims_per_head // 2, 2)
+                .transpose(1, 2)
+                .reshape(num_shards, -1)
+                .repeat_interleave(num_key_value_heads // num_shards, 0)
+            )
+            state_dict[f"model.layers.{layer_i}.self_attn.k_norm.bias"] = (
+                torch.cat([l[f"layers.{layer_i}.attention.k_normalization.bias"].unsqueeze(0) for l in loaded])
+                .view(num_shards, dims_per_head // 2, 2)
+                .transpose(1, 2)
+                .reshape(num_shards, -1)
+                .repeat_interleave(num_key_value_heads // num_shards, 0)
+            )
+
             state_dict[f"model.layers.{layer_i}.self_attn.v_proj.weight"] = torch.cat(
                 [
                     loaded[i][f"layers.{layer_i}.attention.wv.weight"].view(
@@ -266,8 +316,6 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
     vqgan_path = os.path.join(input_base_path, "tokenizer/vqgan.ckpt")
     vqgan_state_dict = torch.load(vqgan_path, map_location="cpu")["state_dict"]
     for k, v in vqgan_state_dict.items():
-        if "decoder" in k:
-            continue  # we dont do image generation yet
         state_dict[f"model.vqmodel.{k}"] = v
 
     # Write configs
@@ -294,6 +342,8 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
         ("out_ch", "out_channels"),
         ("n_embed", "num_embeddings"),
         ("ch_mult", "channel_multiplier"),
+        ("double_z", "double_latent"),
+        ("z_channels", "latent_channels"),
     ]
     with open(os.path.join(input_base_path, "tokenizer/vqgan.yaml")) as vqgan_cfg_file:
         vq_config = yaml.safe_load(vqgan_cfg_file)["model"]["params"]
@@ -314,16 +364,29 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
         vocab_size=VOCAB_SIZE,
         rope_theta=base,
         max_position_embeddings=max_position_embeddings,
-        qk_layernorm=qk_layernorm,
+        model_parallel_size=model_parallel_size,
         swin_norm=swin_norm,
         vq_config=vq_config,
         vocabulary_map=vocabulary_map,
+        image_token_id=vocabulary_map["<image>"],
+        boi_token_id=vocabulary_map["<racm3:break>"],
+        eoi_token_id=vocabulary_map["<eoss>"],
     )
     with init_empty_weights():
-        model = ChameleonForCausalLM(config)
+        model = ChameleonForConditionalGeneration(config)
+
+    # Add to generation config
+    model.generation_config._from_model_config = False
+    model.generation_config.multimodal_generation_mode = "text-only"
+    model.generation_config.do_sample = True
+    model.generation_config.temperature = 0.7
+    model.generation_config.top_p = 0.7
 
     model.load_state_dict(state_dict, assign=True, strict=False)
     model.save_pretrained(model_path, safe_serialization=True)
+
+    if vqvae_path is not None:
+        model.model.vqmodel.save_pretrained(vqvae_path, safe_serialization=True)
 
     # Load and save the processor
     tokenizer = LlamaTokenizerFast(
@@ -345,7 +408,9 @@ def write_model(model_path, input_base_path, model_size, chameleon_version=1):
     # taken from https://github.com/facebookresearch/chameleon/blob/7a72f40aa5f462965c8374f25257f55b65b25ff4/data/prompts_for_human_evaluations.jsonl
     print("Loading the checkpoint in a Chameleon model...")
     print("*" * 100)
-    model = ChameleonForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
+    model = ChameleonForConditionalGeneration.from_pretrained(
+        model_path, attn_implementation="eager", torch_dtype=torch.bfloat16, device_map="auto"
+    )
     processor = ChameleonProcessor.from_pretrained(model_path)
 
     prompt = "I'm very intrigued by this work of art:<image>Please tell me about the artist."
@@ -390,11 +455,16 @@ def main():
         "--model_size",
         choices=["7B", "30B"],
         help=""
-        " models correspond to the finetuned versions, and are specific to the Chameleon official release. For more details on Chameleon, checkout the original repo: https://huggingface.co/meta-chameleon",
+        " models correspond to the finetuned versions, and are specific to the Chameleon official release. For more details on Chameleon, checkout the original repo: https://github.com/facebookresearch/chameleon",
     )
     parser.add_argument(
         "--output_dir",
         help="Location to write HF model",
+    )
+    parser.add_argument(
+        "--test_inference",
+        action="store_true",
+        help="Whether to load the model for generation to test it's converted correctly.",
     )
     # Different Chameleon versions used different default values for max_position_embeddings, hence the need to be able to specify which version is being used.
     parser.add_argument(
@@ -404,12 +474,18 @@ def main():
         type=int,
         help="Version of the Chameleon model to convert",
     )
+    parser.add_argument(
+        "--vqvae_path",
+        default=None,
+        help="Location to write VQ-VAE model",
+    )
     args = parser.parse_args()
     write_model(
         model_path=args.output_dir,
         input_base_path=args.input_dir,
         model_size=args.model_size,
         chameleon_version=args.chameleon_version,
+        vqvae_path=args.vqvae_path,
     )
 
 

@@ -96,6 +96,7 @@ class TokenManager:
         vqgan_ckpt_path: str,
         device: str | None = None,
     ):
+       
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
         self.vocab = VocabInfo(json.load(open(tokenizer_path))["model"]["vocab"])
         self.translation = VocabTranslation(self.vocab, device=device)
@@ -493,6 +494,8 @@ def _worker_impl(
     torch.cuda.set_device(rank)
     if isinstance(model, str):
         model = loader.load_model(model, rank=rank)
+        print(model.layers[0].attention.q_normalization.weight.shape)###
+
     dctx.ready_barrier.wait()
 
     is_coord = rank == 0
@@ -629,7 +632,7 @@ class ChameleonInferenceModel:
             ]
 
         assert batch_input_ids
-
+       
         if not options.txt and not options.img:
             raise ValueError("Must specify at least one modality.")
         if options.txt and options.img and len(batch_input_ids) > 1:
