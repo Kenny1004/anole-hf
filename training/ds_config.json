@@ -23,5 +23,5 @@
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",
     "wall_clock_breakdown": false,
-    "model_parallel_size":2
+    "model_parallel_size":4
 }

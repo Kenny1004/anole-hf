@@ -13,11 +13,8 @@ DATASET_TOKENIZED_PATH = Path("./dataset_tokenized.jsonl")
 # Tokenized dataset (specify the path that you want to store your images)
 DATASET_IMAGE_PATH = Path("./images/")
 
-# Anole torch path (specify the path that you want to store your Anole torch checkpoint)
-ANOLE_PATH_TORCH = Path("./model/anole/")
+#The path of the original model.
+ANOLE_INITIAL_MODEL=Path("")
 
-# Anole HF path (specify the path that you want to store your Anole hugging face checkpoint)
-ANOLE_PATH_HF = Path("/home/zlhu/data2/zlhu/facebook/chameleon-30b")
-
-# Anole HF path (specify the path that you want to store your fine-tuned Anole hugging face checkpoint)
-ANOLE_PATH_HF_TRAINED = Path("/home/zlhu/data2/zlhu/chameleon-7b")
+#The path of the trained model.
+ANOLE_TRAINED_MODEL=Path("")

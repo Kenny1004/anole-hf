@@ -277,7 +277,7 @@ class ChameleonLayerNorm(nn.LayerNorm):
     def __init__(self, hidden_size, *args, **kwargs):
         super().__init__(hidden_size, *args, **kwargs)
         self.normalized_shape = (hidden_size[-1],)
-
+   
     def forward(self, hidden_states):
         hidden_states = F.layer_norm(hidden_states, self.normalized_shape, None, None, eps=1e-5)
         hidden_states = hidden_states * self.weight + self.bias
