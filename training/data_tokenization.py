@@ -28,7 +28,7 @@ if __name__ == "__main__":
         text_tokens = processor.tokenizer(entry['text'])['input_ids']
         pixel_value=processor.image_processor(Image.open(entry["image"]))['pixel_values']
         image_tokens = model.get_image_tokens(torch.from_numpy(pixel_value[0]).unsqueeze(0).to(torch.bfloat16).cuda()).tolist()
-        entry['text_tokens'] = text_tokens 
+        entry['text_tokens'] = text_tokens +[8710] #token for chat 
         entry['image_tokens'] = [8197]+image_tokens[0]+[8196]
         output_data.append(entry)
         print(entry)
