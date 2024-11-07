@@ -112,11 +112,11 @@ for param in model.lm_head.parameters():
     #print(param.shape)    
     # Compute the standard deviation for He initialization
     param.requires_grad = False
-    std_dev = (2.0 / 8192) ** 0.5
+    std_dev = (2.0 / 4096) ** 0.5
 
     # Initialize the specific rows with He initialization
 
-    param[4:8196] = torch.randn((8196 - 4, 8192)) * std_dev 
+    param[4:8196] = torch.randn((8196 - 4, 4096)) * std_dev 
     param.requires_grad = True
 '''
 

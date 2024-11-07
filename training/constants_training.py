@@ -5,13 +5,13 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Raw dataset (specify the path of your raw dataset)
-DATASET_RAW_PATH = Path("./dataset_raw.jsonl")
+DATASET_RAW_PATH = Path("")
 
 # Tokenized dataset (specify the path that you want to store your tokenized dataset)
-DATASET_TOKENIZED_PATH = Path("./dataset_tokenized.jsonl")
+DATASET_TOKENIZED_PATH = Path("")
 
 # Tokenized dataset (specify the path that you want to store your images)
-DATASET_IMAGE_PATH = Path("./images/")
+DATASET_IMAGE_PATH = Path("")
 
 #The path of the original model.
 ANOLE_INITIAL_MODEL=Path("")

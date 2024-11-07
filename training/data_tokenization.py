@@ -1,6 +1,5 @@
 import os
 import json
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from PIL import Image
 from tqdm import tqdm
 from transformers import ChameleonProcessor, ChameleonModel
@@ -31,7 +30,7 @@ if __name__ == "__main__":
         entry['text_tokens'] = text_tokens +[8710] #token for chat 
         entry['image_tokens'] = [8197]+image_tokens[0]+[8196]
         output_data.append(entry)
-        print(entry)
+        #print(entry)
 
 
     output_file_path = DATASET_TOKENIZED_PATH

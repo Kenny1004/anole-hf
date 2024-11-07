@@ -22,7 +22,6 @@ def main(args: argparse.Namespace):
 
     # Preprocess the prompt
     inputs = processor(prompt, padding=True, return_tensors="pt").to(model.device, dtype=model.dtype)
-
     # Generate discrete image tokens
     generate_ids = model.generate(
         **inputs,
@@ -41,10 +40,12 @@ def main(args: argparse.Namespace):
   
     images = processor.postprocess_pixel_values(pixel_values)
     
-    os.makedirs(Path(args.save_dir)/args.instruction.replace(" ","_"))
+    #os.makedirs(Path(args.save_dir)/args.instruction.replace(" ","_"))
+    os.makedirs(Path(args.save_dir)/"ins2")
     for idx in range(images.shape[0]):
         image = to_pil_image(images[idx].detach().cpu())
-        save_path=Path(args.save_dir)/args.instruction.replace(" ","_")/"{}.png".format(idx)
+        #save_path=Path(args.save_dir)/args.instruction.replace(" ","_")/"{}.png".format(idx)
+        save_path=Path(args.save_dir)/"ins2"/"{}.png".format(idx)
         image.save(save_path)
 
 
@@ -53,7 +54,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate images based on text instructions.")
     parser.add_argument("-i", "--instruction", type=str, required=True, help="The instruction for image generation.")
     parser.add_argument("-b", "--batch_size", type=int, default=10, help="The number of images to generate.")
-    parser.add_argument("-s", "--save_dir", type=str, default="./outputs/text2image/", help="The directory to save the generated images.")
+    parser.add_argument("-s", "--save_dir", type=str, default="./outputs/output_expri/text2image/", help="The directory to save the generated images.")
     args: argparse.Namespace = parser.parse_args()
     return args
 

@@ -20,17 +20,14 @@ from constants_training import (
 )
 
 # Define the dataset class
-
-
 class TokenizedDataset(Dataset):
     def __init__(self, filepath):
         self.tokenized_data = []
         with jsonlines.open(filepath) as reader:
             for (idx,obj) in enumerate(reader):#modifiy here for
-                if (obj['image_tokens']!=[]):
                     self.tokenized_data.append(torch.tensor(obj['text_tokens']+obj['image_tokens'], dtype=torch.long))
-                else:
-                    self.tokenized_data.append(torch.tensor(obj['text_tokens'],dtype=torch.long))
+    
+        #self.tokenized_data=self.tokenized_data[:5]#
     
     def __len__(self):
         return len(self.tokenized_data)
@@ -60,7 +57,7 @@ print("Length of dataset:{}.".format(len(dataset)))
 # Define training arguments
 training_args = TrainingArguments(
     output_dir=ANOLE_TRAINED_MODEL,
-    learning_rate=1e-4,
+    learning_rate=1e-3,
     num_train_epochs=3,
     per_device_train_batch_size=1,
     save_steps=120000,
@@ -74,9 +71,11 @@ training_args = TrainingArguments(
 )
 print(model.device)
 
-
+       
+#To add Z-loss, use trainer below
+'''
 trainer = Zloss_Trainer(
-    zloss_coef=1e-5,
+    zloss_coef=2e-5,
     model=model,
     args=training_args,
     train_dataset=dataset,
@@ -89,49 +88,39 @@ trainer = Trainer(
     train_dataset=dataset,
     data_collator=collate_fn,
 )
-'''
 
-#This hook is used to constrain the Chameleon norm weight in the Hugging Face version, ensuring its dimensions correspond with the Torch version.
-def reset_norm_grad(grad):
-    #print(hidden_size[-1])
-    hidden_size=grad.shape
-    if hidden_size[0]==32: #(0,31) the same
-        for head_dim in range(hidden_size[-1]):
-            grad[0,head_dim]=grad[:,head_dim].sum()
-            grad[1:hidden_size[-2],head_dim]=grad[0,head_dim]
-    if hidden_size[0]==64:#(0,15) (16,31) (32,47) (48,63) the same weight
-        for shards_rank in range(0,4):
-            for head_dim in range(hidden_size[-1]):
-                grad[0,head_dim]=grad[shards_rank*16:shards_rank*16+16,head_dim].sum()
-                grad[shards_rank*16+1:shards_rank*16+16,head_dim]=grad[shards_rank*16,head_dim]
+# Define the range of weights that should remain trainable
+trainable_range = (4, 8196)
+
+# Define a hook to zero out the gradient for weights outside the trainable range during the backward pass
+def zero_out_gradient(grad):
+    grad[:trainable_range[0], :] = 0
+    grad[trainable_range[1] + 1:, :] = 0
+    return grad
+
+# Freeze all layers except the output layer
 
 
-#Add it if you want to initialize the value of LM_head
-'''
+for param in model.parameters():
+    param.requires_grad = False
+    
+
 for param in model.lm_head.parameters():
     #print(param.shape)    
     # Compute the standard deviation for He initialization
-    param.requires_grad = False
-    std_dev = (2.0 / 8192) ** 0.5
+
+    std_dev = (2.0 / 4096) ** 0.5
 
     # Initialize the specific rows with He initialization
 
-    param[4:8196] = torch.randn((8196 - 4, 8192)) * std_dev 
-    param.requires_grad = True
-'''
+    param[4:8196] = torch.randn((8196 - 4, 4096)) * std_dev 
 
-idx=0
-for layer in model.model.layers:
-    print("solving layer{}.".format(idx))
-    idx+=1
-    layer.self_attn.q_norm.weight.register_hook(reset_norm_grad)
-    layer.self_attn.q_norm.bias.register_hook(reset_norm_grad)
-    layer.self_attn.k_norm.weight.register_hook(reset_norm_grad)
-    layer.self_attn.k_norm.bias.register_hook(reset_norm_grad)
+    param.requires_grad = True
+    # Register the hook on the weight tensor
+    param.register_hook(zero_out_gradient)
 
 
 trainer.train()
+
 processor = ChameleonProcessor.from_pretrained(ANOLE_INITIAL_MODEL)
 processor.save_pretrained(ANOLE_TRAINED_MODEL)
-print("Finish.")
-

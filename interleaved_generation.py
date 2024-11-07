@@ -80,6 +80,8 @@ def main(args: argparse.Namespace):
         image_list.append(image)
 
     # Preprocess the prompt
+    if image_list==[]:
+        image_list=None
     inputs = processor(prompt,images=image_list,padding=True,return_tensors="pt",).to(model.device, dtype=model.dtype)
 
     # Generate interleaved text and discrete image tokens
@@ -88,7 +90,7 @@ def main(args: argparse.Namespace):
         **inputs,
         multimodal_generation_mode="interleaved-text-image",
         # Note: We will need a larger `max_new_tokens` value since we are generating both text and image tokens.
-        max_new_tokens=3000,
+        max_new_tokens=8192,
         # This is important because most of the image tokens during training were for "empty" patches, so greedy decoding of image tokens will likely result in a blank image.
         do_sample=True,
     )

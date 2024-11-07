@@ -1,10 +1,10 @@
 [
     {
         "type": "text",
-        "content": "And please draw more pictures like it <image>."
+        "content": "Explain each step to cook eggs. Show me consistent pictures of the whole process."
     },
     {
         "type": "image",
-        "content": ["/home/zlhu/data2/zlhu/anole_new/snowman.jpg"]
+        "content": ""
     }
 ]
