@@ -1,10 +1,10 @@
 [
     {
         "type": "text",
-        "content": "Explain each step to cook eggs. Show me consistent pictures of the whole process."
+        "content": "What can I bake with this? Give me the full recipe and show me an image with the final dish. <image>"
     },
     {
         "type": "image",
-        "content": ""
+        "content": ["./banana.png"]
     }
 ]

@@ -2,13 +2,10 @@
 
 You can train Anole on your custom data. Note that the current training code has not been fully verified, but we will continuously update it soon!
 
-## Steps
+## Steps 
 
+1. Prepare your raw finetuning data like examples below
 
-
-1. Prepare your raw finetuning data like [this](https://github.com/GAIR-NLP/PrivateChameleon/blob/main/facilitating_image_generation/dataset_raw.jsonl)
-
-Note: Current code only supports finetuning on one-text segment and one image, we will support multiple interleaved text segments and images finetuning soon.
 ```
 # Example samples
 {"text": "Give me an image of Orange juice in a mason glass with an orange cut in half and wooden orange squeezer.", "image": "/path/to/image/1.png"}
@@ -22,9 +19,9 @@ Note: Current code only supports finetuning on one-text segment and one image, w
 bash prepare_data.sh
 ```
 
-4. train the model using huggingface trainer
+4. train the model using huggingface trainer.\
+You can refer to the *train.sh* script for training instructions.\
+*finetune* script only train the parameters of LM_head, while *train* script train all the parameters of the model.
 ```
 bash train.sh
 ```
-
-
